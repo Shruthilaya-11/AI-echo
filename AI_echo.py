@@ -1,31 +1,39 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import train_test_split
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import LinearSVC
-from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
-from wordcloud import WordCloud
-import numpy as np
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from nltk.sentiment import SentimentIntensityAnalyzer
+from transformers import pipeline
+import torch
+from typing import Tuple, Dict
 
-st.set_page_config(page_title="AI Echo — Sentiment Explorer",layout="wide")
-st.title("AI Echo — Sentiment Explorer")
+# ---------------------------
+# Streamlit page config
+# ---------------------------
+st.set_page_config(page_title="AI Echo — Sentiment Explorer", layout="wide")
+st.title("🧠 AI Echo — Sentiment & EDA Explorer")
 
-# Load Data
+# ---------------------------
+# Load Dataset
+# ---------------------------
 @st.cache_data
 def load_data():
     df = pd.read_csv(r"C:\Users\Shruthilaya\GUVI\data\chatgpt_style_reviews_dataset.xlsx - Sheet1.csv")
-    # Fix date
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df[['date', 'platform', 'review', 'rating', 'helpful_votes', 'verified_purchase']].dropna()
     return df
 
 df = load_data()
+st.markdown("### Dataset Preview")
+st.dataframe(df.head())
 
+# ---------------------------
 # Sentiment Labeling
-#1-2 = negative, 3 = neutral, 4-5 = positive
+# ---------------------------
 def label_sentiment(rating):
     if rating <= 2:
         return "negative"
@@ -34,137 +42,183 @@ def label_sentiment(rating):
     else:
         return "positive"
 
-df["sentiment"] = df["rating"].apply(label_sentiment)
+df['sentiment'] = df['rating'].apply(label_sentiment)
 
-
-# EDA 
-st.subheader("EDA Insights")
-
-# Helpful Reviews + Word Clouds
+# ---------------------------
+# Exploratory Data Analysis
+# ---------------------------
+st.header("Exploratory Data Analysis")
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown("###Helpful Reviews")
-    helpful_count = (df["helpful_votes"] > 10).sum()
-    not_helpful_count = (df["helpful_votes"] <= 10).sum()
+    st.subheader("Rating Distribution")
     fig, ax = plt.subplots()
-    ax.pie([helpful_count, not_helpful_count],
-           labels=["Helpful", "Not Helpful"],
-           autopct="%1.1f%%",
-           colors=["green", "red"])
+    sns.countplot(x='rating', data=df, ax=ax, palette="coolwarm")
     st.pyplot(fig)
 
 with col2:
-    st.markdown("###Common Keywords (Positive vs Negative)")
-    positive_reviews = " ".join(df[df["rating"] >= 4]["review"].astype(str))
-    negative_reviews = " ".join(df[df["rating"] <= 2]["review"].astype(str))
-
-    pos_wc = WordCloud(width=600, height=400, background_color="white").generate(positive_reviews)
-    neg_wc = WordCloud(width=600, height=400, background_color="black", colormap="Reds").generate(negative_reviews)
-
-    subcol1, subcol2 = st.columns(2)
-    with subcol1:
-        st.markdown("**Positive**")
-        st.image(pos_wc.to_array(), use_container_width=True)
-    with subcol2:
-        st.markdown("**Negative**")
-        st.image(neg_wc.to_array(), use_container_width=True)
-
-#Ratings Over Time + Rating Distribution
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown("###Average Rating Over Time")
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    trend = df.groupby("date")["rating"].mean()
+    st.subheader("Sentiment Breakdown")
     fig, ax = plt.subplots()
-    trend.plot(ax=ax)
-    ax.set_ylabel("Average Rating")
+    sns.countplot(x='sentiment', data=df, ax=ax, palette="viridis")
     st.pyplot(fig)
 
-with col2:
-    st.markdown("###Rating Distribution")
-    fig, ax = plt.subplots()
-    sns.countplot(x="rating", data=df, ax=ax)
-    st.pyplot(fig)  
-
-# Platform + Verified + Sentiment breakdown
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.markdown("### Ratings by Platform")
-    fig, ax = plt.subplots()
-    sns.barplot(x="platform", y="rating", data=df, ax=ax, estimator=np.mean)
-    st.pyplot(fig)
-
-with col2:
-    st.markdown("###Verified vs Non-Verified")
-    fig, ax = plt.subplots()
-    sns.barplot(x="verified_purchase", y="rating", data=df, ax=ax, estimator=np.mean)
-    st.pyplot(fig)
-
+col3, col4 = st.columns(2)
 with col3:
-    st.write("### Sentiment Breakdown")
+    st.subheader("Verified vs Non-Verified Average Ratings")
     fig, ax = plt.subplots()
-    sns.countplot(x="sentiment", data=df, ax=ax)
+    sns.barplot(x='verified_purchase', y='rating', data=df, ax=ax)
     st.pyplot(fig)
 
-# Review Length + 1-Star Words
+with col4:
+    st.subheader("Platform-wise Average Ratings")
+    fig, ax = plt.subplots()
+    sns.barplot(x='platform', y='rating', data=df, ax=ax)
+    plt.xticks(rotation=30)
+    st.pyplot(fig)
+
+# ---------------------------
+# NLTK Setup for Text Preprocessing
+# ---------------------------
+_required_nltk = ["punkt", "stopwords", "wordnet", "omw-1.4", "vader_lexicon"]
+for pkg in _required_nltk:
+    try:
+        nltk.data.find(pkg)
+    except LookupError:
+        nltk.download(pkg)
+
+STOPWORDS = set(stopwords.words("english"))
+lemmatizer = WordNetLemmatizer()
+
+# ---------------------------
+# Text Cleaning
+# ---------------------------
+def clean_text(text: str, keep_case: bool=False) -> str:
+    if text is None:
+        return ""
+    text = str(text)
+    if not keep_case:
+        text = text.lower()
+    text = re.sub(r"http\S+|www\.\S+", " ", text)
+    text = re.sub(r"@\w+", " ", text)
+    text = re.sub(r"[^a-zA-Z\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    tokens = nltk.word_tokenize(text)
+    filtered = [lemmatizer.lemmatize(tok) for tok in tokens if tok not in STOPWORDS]
+    return " ".join(filtered)
+
+df['clean_review'] = df['review'].astype(str).apply(clean_text)
+
+# ---------------------------
+# Load VADER & Transformers
+# ---------------------------
+@st.cache_resource
+def load_vader():
+    return SentimentIntensityAnalyzer()
+
+@st.cache_resource
+def load_transformer_pipeline(model_name="distilbert-base-uncased-finetuned-sst-2-english"):
+    device = 0 if torch.cuda.is_available() else -1
+    return pipeline("sentiment-analysis", model=model_name, framework="pt", device=device)
+
+vader = load_vader()
+try:
+    bert_pipe = load_transformer_pipeline()
+    hf_load_error = None
+except Exception as e:
+    bert_pipe = None
+    hf_load_error = e
+
+# ---------------------------
+# Utility Functions
+# ---------------------------
+def vader_result_to_label(score_dict: Dict[str, float]) -> Tuple[str, float]:
+    comp = score_dict.get("compound", 0.0)
+    if comp >= 0.05:
+        return "Positive", comp
+    elif comp <= -0.05:
+        return "Negative", comp
+    else:
+        return "Neutral", comp
+
+def hf_label_normalize(hf_output):
+    if isinstance(hf_output, list) and len(hf_output) > 0:
+        out = hf_output[0]
+        lbl = out.get("label", "")
+        score = float(out.get("score", 0.0))
+        if lbl.lower().startswith("pos"):
+            return "Positive", score
+        elif lbl.lower().startswith("neg"):
+            return "Negative", score
+        else:
+            return lbl.title(), score
+    return "Unknown", 0.0
+
+# ---------------------------
+# Streamlit UI — Sentiment Analysis
+# ---------------------------
+st.header("Live Sentiment Analysis — VADER vs DistilBERT")
+
+user_text = st.text_area("Enter a review or sentence here:", height=160)
+
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown("### Review Length per Rating")
-    df["review_length"] = df["review"].astype(str).apply(len)
-    fig, ax = plt.subplots()
-    sns.boxplot(x="rating", y="review_length", data=df, ax=ax)
-    st.pyplot(fig)
+    if st.button("Run VADER"):
+        if not user_text.strip():
+            st.warning("Please enter text!")
+        else:
+            cleaned = clean_text(user_text)
+            label_v, score_v = vader_result_to_label(vader.polarity_scores(user_text))
+            st.metric("VADER label", label_v)
+            st.write(f"Compound score: {score_v:.3f}")
+            st.write("Full scores:", vader.polarity_scores(user_text))
+            st.write("Cleaned text:", cleaned)
 
 with col2:
-    st.markdown("### Common Words in 1-Star Reviews")
-    one_star_text = " ".join(df[df["rating"] == 1]["review"].astype(str))
-    one_wc = WordCloud(width=600, height=400, background_color="white", colormap="Reds").generate(one_star_text)
-    st.image(one_wc.to_array(), use_container_width=True)
+    if st.button("Run DistilBERT"):
+        if not user_text.strip():
+            st.warning("Please enter text!")
+        else:
+            if hf_load_error:
+                st.error(f"HF load error: {hf_load_error}")
+            else:
+                cleaned = clean_text(user_text)
+                hf_out = bert_pipe(user_text)
+                label_hf, score_hf = hf_label_normalize(hf_out)
+                st.metric("DistilBERT label", label_hf)
+                st.write(f"Confidence: {score_hf:.3f}")
+                st.write("Model output:", hf_out)
+                st.write("Cleaned text:", cleaned)
 
+st.markdown("---")
+st.subheader("Side-by-side Comparison")
 
-# ML Section
-st.subheader("ML Model — Sentiment Classification")
+if st.button("Run both"):
+    if not user_text.strip():
+        st.warning("Please enter text!")
+    else:
+        cleaned = clean_text(user_text)
+        v_scores = vader.polarity_scores(user_text)
+        v_label, v_comp = vader_result_to_label(v_scores)
 
-X = df["review"]
-y = df["sentiment"]
+        if hf_load_error:
+            hf_label, hf_score = "Error", 0.0
+        else:
+            hf_out = bert_pipe(user_text)
+            hf_label, hf_score = hf_label_normalize(hf_out)
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### VADER")
+            st.write(f"Label: {v_label}")
+            st.write(f"Compound score: {v_comp:.3f}")
+            st.write("Detailed scores:", v_scores)
+        with c2:
+            st.markdown("### DistilBERT")
+            st.write(f"Label: {hf_label}")
+            st.write(f"Confidence: {hf_score:.3f}")
+            if not hf_load_error:
+                st.write("Model output:", hf_out)
 
-vectorizer = TfidfVectorizer(stop_words="english")
-X_train_vec = vectorizer.fit_transform(X_train)
-X_test_vec = vectorizer.transform(X_test)
-
-model_choice = st.radio("Pick a model:", ["Naive Bayes", "Logistic Regression", "Linear SVM"])
-
-if model_choice == "Naive Bayes":
-    model = MultinomialNB()
-elif model_choice == "Logistic Regression":
-    model = LogisticRegression(max_iter=1000)
-else:
-    model = LinearSVC()
-
-model.fit(X_train_vec, y_train)
-y_pred = model.predict(X_test_vec)
-
-st.write("Accuracy:", round(accuracy_score(y_test, y_pred), 3))
-st.text(classification_report(y_test, y_pred))
-
-# AUC
-try:
-    if hasattr(model, "predict_proba"):
-        auc = roc_auc_score(pd.get_dummies(y_test), model.predict_proba(X_test_vec), multi_class="ovr")
-    elif hasattr(model, "decision_function"):
-        auc = roc_auc_score(pd.get_dummies(y_test), model.decision_function(X_test_vec), multi_class="ovr")
-    st.write("Macro AUC:", round(auc, 3))
-except Exception as e:
-    st.warning(f"AUC not available for this model: {e}")
-
-user_text = st.text_area("Write a fake review:")
-if st.button("Analyze") and user_text.strip() != "":
-    user_vec = vectorizer.transform([user_text])
-    pred = model.predict(user_vec)[0]
-    st.success(f"Predicted sentiment: **{pred}**")
+st.markdown("---")
+st.caption("App combines EDA, text cleaning, and sentiment comparison (VADER vs DistilBERT). LSTM modeling/training can be plugged in here if needed.")
